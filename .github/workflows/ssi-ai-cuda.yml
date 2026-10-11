@@ -13,6 +13,7 @@ on:
 # Required for the optional history-persistence job.
 permissions:
   contents: write
+
 jobs:
   cuda-regression:
     name: CUDA correctness and benchmark
@@ -81,16 +82,67 @@ jobs:
           fi
 
       - name: Check rolling-median regression
+        id: regression
+        continue-on-error: true
         run: |
+          set +e
           python ci/ssi-ai/scripts/check_rolling_regression.py \
             --current artifacts/current/results.json \
             --history-glob 'artifacts/history/**/*.json' \
             --output artifacts/current/regression_report.json \
             --metric local_ms \
             --threshold 0.25 \
+            --improvement-threshold 0.10 \
             --min-samples 3 \
             --min-absolute-ms 0.05 \
             --max-seq-len 2048
+          code=$?
+          python - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+          report = json.loads(Path("artifacts/current/regression_report.json").read_text())
+          print(f"regressions={len(report.get('regressions', []))}")
+          print(f"improvements={len(report.get('improvements', []))}")
+          PY
+          echo "exit_code=$code" >> "$GITHUB_OUTPUT"
+          exit "$code"
+
+      - name: Build notification summary
+        id: summary
+        if: always()
+        run: |
+          python - <<'PY'
+          import json
+          from pathlib import Path
+          report = json.loads(Path("artifacts/current/regression_report.json").read_text())
+          lines = ["*SSi-AI CUDA performance update*", f"Workflow: {__import__('os').environ.get('GITHUB_SERVER_URL')}/{__import__('os').environ.get('GITHUB_REPOSITORY')}/actions/runs/{__import__('os').environ.get('GITHUB_RUN_ID')}"]
+          for key, label in (("regressions", "Regression"), ("improvements", "Improvement")):
+              for row in report.get(key, []):
+                  lines.append(f"{label}: seq={row['seq_len']} current={row['current_ms']:.3f} ms, median={row['historical_median_ms']:.3f} ms")
+          Path("artifacts/current/notification.txt").write_text("\n".join(lines) + "\n")
+          print("summary_written=true")
+          PY
+
+      - name: Notify Slack of performance change
+        if: always() && env.SLACK_WEBHOOK_URL != '' && (steps.regression.outputs.regressions != '0' || steps.regression.outputs.improvements != '0')
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          python - <<'PY' > /tmp/slack_payload.json
+          import json
+          from pathlib import Path
+          print(json.dumps({"text": Path("artifacts/current/notification.txt").read_text()}))
+          PY
+          curl --fail --silent --show-error --max-time 20 \
+            -H 'Content-Type: application/json' \
+            --data @/tmp/slack_payload.json \
+            "$SLACK_WEBHOOK_URL"
+
+      - name: Fail job on performance regression
+        if: always() && steps.regression.outputs.regressions != '0'
+        run: |
+          echo "SSi-AI CUDA performance regression detected. See artifacts/current/regression_report.json."
+          exit 1
 
       - name: Upload CUDA results
         if: always()
@@ -124,7 +176,6 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          cp artifacts/current/results.json /tmp/ssi-ai-results.json
           if git ls-remote --exit-code --heads origin ssi-ai-history >/dev/null 2>&1; then
             git fetch origin ssi-ai-history
             git checkout -B ssi-ai-history origin/ssi-ai-history
@@ -133,7 +184,7 @@ jobs:
             git rm -rf . || true
           fi
           mkdir -p history
-          cp /tmp/ssi-ai-results.json "history/${RUN_ID}.json"
+          cp artifacts/current/results.json "history/${RUN_ID}.json"
           # Keep the most recent 30 results to bound repository size.
           find history -type f -name '*.json' -printf '%T@ %p\n' | sort -nr | tail -n +31 | cut -d' ' -f2- | xargs -r rm -f
           git add history

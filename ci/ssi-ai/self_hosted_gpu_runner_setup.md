@@ -57,3 +57,13 @@ Copy `github_actions_cuda.yml` into the consuming repository as:
 ```
 
 Copy the three SSi-AI scripts into the repository's skill path, or adjust the workflow paths if the skill is stored elsewhere.
+
+## Slack performance alerts
+
+The workflow sends a Slack message only when the rolling checker identifies at least one meaningful improvement or regression. Add the incoming-webhook URL as a repository secret named:
+
+```text
+SLACK_WEBHOOK_URL
+```
+
+Create it under **Repository Settings → Secrets and variables → Actions → New repository secret**. Do not commit the webhook URL to source control. If the secret is absent, the benchmark and regression gate still run and the Slack step is skipped.

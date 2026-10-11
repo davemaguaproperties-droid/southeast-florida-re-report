@@ -58,13 +58,14 @@ def main() -> int:
     parser.add_argument("--output", type=Path, required=True, help="write JSON regression report here")
     parser.add_argument("--metric", default="local_ms", help="benchmark field to evaluate")
     parser.add_argument("--threshold", type=float, default=0.25, help="allowed slowdown as a fraction; 0.25 means 25%%")
+    parser.add_argument("--improvement-threshold", type=float, default=0.10, help="minimum speedup as a fraction to classify as an improvement; 0.10 means 10%% faster")
     parser.add_argument("--min-samples", type=int, default=3, help="minimum prior samples required for a hard decision")
     parser.add_argument("--min-absolute-ms", type=float, default=0.0, help="ignore slowdowns smaller than this absolute amount")
     parser.add_argument("--max-seq-len", type=int, default=None, help="only evaluate sequence lengths up to this value")
     args = parser.parse_args()
 
-    if args.threshold < 0 or args.min_samples < 1 or args.min_absolute_ms < 0:
-        parser.error("threshold must be nonnegative, min-samples must be positive, and min-absolute-ms must be nonnegative")
+    if args.threshold < 0 or args.improvement_threshold < 0 or args.min_samples < 1 or args.min_absolute_ms < 0:
+        parser.error("thresholds must be nonnegative, min-samples must be positive, and min-absolute-ms must be nonnegative")
     if not args.current.is_file():
         print(f"error: current file does not exist: {args.current}", file=sys.stderr)
         return 2
@@ -92,6 +93,7 @@ def main() -> int:
 
     comparisons: list[dict[str, Any]] = []
     regressions: list[dict[str, Any]] = []
+    improvements: list[dict[str, Any]] = []
     for seq_len, current_value in sorted(current_by_seq.items()):
         historical_values: list[float] = []
         sources: list[str] = []
@@ -108,12 +110,19 @@ def main() -> int:
                 break
         baseline = median(historical_values) if historical_values else None
         allowed = (baseline * (1 + args.threshold)) if baseline is not None else None
+        improvement_cutoff = (baseline * (1 - args.improvement_threshold)) if baseline is not None else None
         absolute_delta = (current_value - baseline) if baseline is not None else None
         is_regression = (
             baseline is not None
             and len(historical_values) >= args.min_samples
             and current_value > allowed
             and absolute_delta > args.min_absolute_ms
+        )
+        is_improvement = (
+            baseline is not None
+            and len(historical_values) >= args.min_samples
+            and current_value < improvement_cutoff
+            and abs(absolute_delta) > args.min_absolute_ms
         )
         comparison = {
             "seq_len": seq_len,
@@ -122,25 +131,30 @@ def main() -> int:
             "historical_median_ms": baseline,
             "historical_mad_ms": mad(historical_values, baseline) if baseline is not None else None,
             "allowed_ms": allowed,
+            "improvement_cutoff_ms": improvement_cutoff,
             "absolute_delta_ms": absolute_delta,
             "slowdown_fraction": ((current_value / baseline) - 1) if baseline and baseline > 0 else None,
-            "decision": "REGRESSION" if is_regression else ("PASS" if len(historical_values) >= args.min_samples else "INSUFFICIENT_HISTORY"),
+            "decision": "REGRESSION" if is_regression else ("IMPROVEMENT" if is_improvement else ("PASS" if len(historical_values) >= args.min_samples else "INSUFFICIENT_HISTORY")),
             "history_sources": sources,
         }
         comparisons.append(comparison)
         if is_regression:
             regressions.append(comparison)
+        if is_improvement:
+            improvements.append(comparison)
 
     report = {
-        "status": "FAIL" if regressions else "PASS",
+        "status": "REGRESSION" if regressions else ("IMPROVEMENT" if improvements else "PASS"),
         "metric": args.metric,
         "threshold_fraction": args.threshold,
+        "improvement_threshold_fraction": args.improvement_threshold,
         "min_samples": args.min_samples,
         "min_absolute_ms": args.min_absolute_ms,
         "current_file": str(args.current),
         "history_files_considered": [str(path) for path in history_paths],
         "comparisons": comparisons,
         "regressions": regressions,
+        "improvements": improvements,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(report, indent=2) + "\n")
