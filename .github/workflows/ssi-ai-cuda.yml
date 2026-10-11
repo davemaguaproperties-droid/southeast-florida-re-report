@@ -1,0 +1,141 @@
+name: SSi-AI CUDA regression
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "ci/ssi-ai/**"
+      - ".github/workflows/ssi-ai-cuda.yml"
+  schedule:
+    - cron: "30 3 * * *"
+  workflow_dispatch:
+
+# Required for the optional history-persistence job.
+permissions:
+  contents: write
+jobs:
+  cuda-regression:
+    name: CUDA correctness and benchmark
+    # Register the host with all four labels, or adjust this list to your labels.
+    runs-on: [self-hosted, linux, x64, cuda, gpu]
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Inspect GPU and driver
+        run: |
+          nvidia-smi
+          python3 --version
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install CUDA-enabled Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          # Match this wheel index to the host driver supported by your runner.
+          python -m pip install torch matplotlib \
+            --index-url https://download.pytorch.org/whl/cu124
+
+      - name: Verify CUDA is usable
+        run: |
+          python - <<'PY'
+          import torch
+          assert torch.cuda.is_available(), torch.cuda.get_device_name(0) if torch.cuda.device_count() else "no CUDA device"
+          print("torch:", torch.__version__)
+          print("device:", torch.cuda.get_device_name(0))
+          print("capability:", torch.cuda.get_device_capability(0))
+          PY
+
+      - name: Run SSi-AI checks and CUDA benchmark
+        run: |
+          python ci/ssi-ai/scripts/ssi_daily.py \
+            --mode all \
+            --device cuda \
+            --batch-size 1 \
+            --d-model 128 \
+            --n-heads 4 \
+            --window-size 32 \
+            --chunk-size 64 \
+            --num-sink-tokens 2 \
+            --seq-lengths 128 256 512 1024 2048 \
+            --warmups 3 \
+            --iterations 10 \
+            --compare-dense \
+            --max-dense-seq-len 1024 \
+            --plot \
+            --output-dir artifacts/current
+
+      - name: Fetch prior result history branch
+        run: |
+          mkdir -p artifacts/history
+          if git ls-remote --exit-code --heads origin ssi-ai-history >/dev/null 2>&1; then
+            git fetch origin ssi-ai-history
+            git archive origin/ssi-ai-history history/ | tar -x --strip-components=1 -C artifacts/history
+          fi
+
+      - name: Check rolling-median regression
+        run: |
+          python ci/ssi-ai/scripts/check_rolling_regression.py \
+            --current artifacts/current/results.json \
+            --history-glob 'artifacts/history/**/*.json' \
+            --output artifacts/current/regression_report.json \
+            --metric local_ms \
+            --threshold 0.25 \
+            --min-samples 3 \
+            --min-absolute-ms 0.05 \
+            --max-seq-len 2048
+
+      - name: Upload CUDA results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssi-ai-cuda-${{ github.run_id }}
+          path: artifacts/current/
+          if-no-files-found: error
+
+  persist-history:
+    name: Persist benchmark history
+    needs: cuda-regression
+    if: success() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main')
+    runs-on: [self-hosted, linux, x64, cuda, gpu]
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Download current benchmark artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ssi-ai-cuda-${{ github.run_id }}
+          path: artifacts/current
+
+      - name: Append result to history branch
+        env:
+          RUN_ID: ${{ github.run_id }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          cp artifacts/current/results.json /tmp/ssi-ai-results.json
+          if git ls-remote --exit-code --heads origin ssi-ai-history >/dev/null 2>&1; then
+            git fetch origin ssi-ai-history
+            git checkout -B ssi-ai-history origin/ssi-ai-history
+          else
+            git checkout --orphan ssi-ai-history
+            git rm -rf . || true
+          fi
+          mkdir -p history
+          cp /tmp/ssi-ai-results.json "history/${RUN_ID}.json"
+          # Keep the most recent 30 results to bound repository size.
+          find history -type f -name '*.json' -printf '%T@ %p\n' | sort -nr | tail -n +31 | cut -d' ' -f2- | xargs -r rm -f
+          git add history
+          git commit -m "ci: record SSi-AI CUDA benchmark ${RUN_ID}" || exit 0
+          git push origin ssi-ai-history
